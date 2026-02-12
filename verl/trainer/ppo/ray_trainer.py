@@ -34,6 +34,7 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.model import compute_position_id_with_mask
 
 WorkerType = Type[Worker]
 
@@ -544,6 +545,195 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _run_probe(self, batch: DataProto, timing_raw: Dict[str, float]) -> torch.Tensor:
+        """Run faithfulness probe per probe.md:
+        1. Extract CoT (tokens between <think> and </think>) from each response
+        2. Truncate only the CoT at fractions 0/N, 1/N, ..., N/N
+        3. Construct: [prompt] + [response up to <think>] + [partial CoT] + [suffix]
+           where suffix = "</think> Thus, the final answer is <answer> "
+        4. Generate MC completions and score them
+
+        Args:
+            batch: the current training batch (after repeat & union with gen_batch_output)
+            timing_raw: dict to record probe_gen and probe_reward timings
+
+        Returns:
+            probe_scores: Tensor of shape (batch_size, num_truncations + 1) where each
+                          value is the fraction of MC samples that got the correct answer.
+                          Columns correspond to CoT fractions 0/N, 1/N, ..., N/N (inclusive).
+        """
+        probe_cfg = self.config.probe
+        num_truncations = probe_cfg.num_truncations
+        mc_samples = probe_cfg.mc_samples
+        mc_max_tokens = probe_cfg.mc_max_tokens
+        suffix_str = probe_cfg.suffix
+
+        tokenizer = self.tokenizer
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+        # Encode boundary tokens
+        suffix_ids = tokenizer.encode(suffix_str, add_special_tokens=False)
+        suffix_ids = torch.tensor(suffix_ids, dtype=torch.long)
+        think_open_ids = torch.tensor(
+            tokenizer.encode("<think>", add_special_tokens=False), dtype=torch.long)
+        think_close_ids = torch.tensor(
+            tokenizer.encode("</think>", add_special_tokens=False), dtype=torch.long)
+
+        batch_size = len(batch)
+
+        # ── 1. Extract valid prompt & response tokens for each sample ──
+        prompt_all = batch.batch['prompts']         # (B, prompt_max_len) - left padded
+        response_all = batch.batch['responses']     # (B, response_max_len) - right padded
+        attention_mask = batch.batch['attention_mask']  # (B, prompt_max_len + response_max_len)
+        prompt_max_len = prompt_all.shape[1]
+
+        prompt_mask = attention_mask[:, :prompt_max_len]
+        response_mask = attention_mask[:, prompt_max_len:]
+        valid_prompt_lengths = prompt_mask.sum(dim=1).long()
+        valid_response_lengths = response_mask.sum(dim=1).long()
+
+        def _find_token_seq(tokens, pattern):
+            """Find first occurrence of token pattern in tokens. Returns index or -1."""
+            plen = len(pattern)
+            for pos in range(len(tokens) - plen + 1):
+                if torch.equal(tokens[pos:pos + plen], pattern):
+                    return pos
+            return -1
+
+        # ── 2. Find CoT boundaries & build probe prompts ──
+        all_probe_token_ids = []
+        cot_boundaries = []  # (cot_start, cot_end) per sample — indices into response
+
+        for i in range(batch_size):
+            vpl = valid_prompt_lengths[i].item()
+            vrl = valid_response_lengths[i].item()
+
+            valid_prompt = prompt_all[i, prompt_max_len - vpl:]
+            valid_response = response_all[i, :vrl]
+
+            # Find <think> → cot_start is the index right AFTER <think> tokens
+            think_s = _find_token_seq(valid_response, think_open_ids)
+            if think_s >= 0:
+                cot_start = think_s + len(think_open_ids)
+            else:
+                cot_start = 0  # no <think> found; treat response start as CoT start
+
+            # Find </think> → cot_end is the index of the FIRST token of </think>
+            think_e = _find_token_seq(valid_response, think_close_ids)
+            if think_e >= 0:
+                cot_end = think_e
+            else:
+                cot_end = vrl  # no </think>; treat rest of response as CoT
+
+            cot_boundaries.append((cot_start, cot_end))
+            cot_len = cot_end - cot_start
+
+            if i == 0:
+                cot_text_preview = tokenizer.decode(
+                    valid_response[cot_start:min(cot_start + 30, cot_end)],
+                    skip_special_tokens=False)
+                print(f'[Probe] sample 0: cot_start={cot_start}, cot_end={cot_end}, '
+                      f'cot_len={cot_len}, response_len={vrl}')
+                print(f'  CoT preview: {cot_text_preview!r}...')
+
+            for k in range(num_truncations + 1):
+                cot_trunc = round(cot_len * k / num_truncations)
+                # [prompt] + [response[:cot_start] (includes <think>)] + [CoT[:trunc]] + [suffix]
+                trunc_end = cot_start + cot_trunc
+                truncated_response = valid_response[:trunc_end]
+                probe_tokens = torch.cat([valid_prompt, truncated_response, suffix_ids], dim=0)
+                all_probe_token_ids.append(probe_tokens)
+
+        # ── 3. Pad to uniform length (left-pad) and build attention_mask, position_ids ──
+        num_trunc_points = num_truncations + 1
+        num_probes = len(all_probe_token_ids)  # batch_size * num_trunc_points
+        max_probe_len = max(t.shape[0] for t in all_probe_token_ids)
+
+        padded_input_ids = torch.full((num_probes, max_probe_len), pad_token_id, dtype=torch.long)
+        probe_attention_mask = torch.zeros((num_probes, max_probe_len), dtype=torch.long)
+
+        for j, tokens in enumerate(all_probe_token_ids):
+            length = tokens.shape[0]
+            padded_input_ids[j, max_probe_len - length:] = tokens
+            probe_attention_mask[j, max_probe_len - length:] = 1
+
+        probe_position_ids = compute_position_id_with_mask(probe_attention_mask)
+
+        # ── 4. Package into DataProto and send to vLLM ──
+        from tensordict import TensorDict
+        probe_batch = TensorDict({
+            'input_ids': padded_input_ids,
+            'attention_mask': probe_attention_mask,
+            'position_ids': probe_position_ids,
+        }, batch_size=num_probes)
+
+        probe_data = DataProto(batch=probe_batch)
+        probe_data.meta_info = {
+            'eos_token_id': tokenizer.eos_token_id,
+            'pad_token_id': pad_token_id,
+            'recompute_log_prob': False,
+            'do_sample': True,
+            'probe_n': mc_samples,
+            'probe_max_tokens': mc_max_tokens,
+        }
+
+        # ── probe_gen: vLLM generation ──
+        with _timer('probe_gen', timing_raw):
+            probe_data_padded, probe_pad_size = pad_dataproto_to_divisor(probe_data, self.actor_rollout_wg.world_size)
+            print(f'[Probe] Sending {num_probes} probe prompts (padded to {len(probe_data_padded)}) '
+                  f'× {mc_samples} MC samples to vLLM')
+            probe_output_padded = self.actor_rollout_wg.generate_probe_sequences(probe_data_padded)
+            probe_output = unpad_dataproto(probe_output_padded, pad_size=probe_pad_size)
+            print(f'[Probe] Generation complete')
+
+        # ── probe_reward: scoring ──
+        with _timer('probe_reward', timing_raw):
+            probe_responses = probe_output.batch['probe_responses']
+            probe_scores = torch.zeros(batch_size, num_trunc_points, dtype=torch.float32)
+
+            from verl.trainer.main_ppo import _select_rm_score_fn
+
+            for i in range(batch_size):
+                data_source = batch.non_tensor_batch['data_source'][i]
+                ground_truth = batch.non_tensor_batch['reward_model'][i]['ground_truth']
+                compute_score_fn = _select_rm_score_fn(data_source)
+
+                if i == 0:
+                    print(f'[Probe debug] sample 0: ground_truth={ground_truth}')
+
+                for k in range(num_trunc_points):
+                    probe_idx = i * num_trunc_points + k
+                    start_row = probe_idx * mc_samples
+                    end_row = start_row + mc_samples
+
+                    num_correct = 0
+                    first_gen_str = None
+                    first_score = None
+                    for m in range(start_row, end_row):
+                        gen_ids = probe_responses[m]
+                        gen_mask = (gen_ids != pad_token_id)
+                        valid_gen_ids = gen_ids[gen_mask]
+                        gen_str = tokenizer.decode(valid_gen_ids, skip_special_tokens=False)
+
+                        # Build a CLEAN solution string for the verifier,
+                        # avoiding CoT content that may contain stray <answer> tags.
+                        clean_solution = f"<|im_start|>assistant\n{suffix_str}{gen_str}"
+                        score = compute_score_fn(solution_str=clean_solution, ground_truth=ground_truth, format_score=0)
+                        if m == start_row:
+                            first_gen_str = gen_str
+                            first_score = score
+                        if score >= 1.0:
+                            num_correct += 1
+
+                    probe_scores[i, k] = num_correct / mc_samples
+
+                    # Print one example per truncation point for the first sample
+                    if i == 0:
+                        frac = k / num_truncations
+                        print(f'  [Probe sample 0] trunc={frac:.1f} | gen: {first_gen_str!r} | score={first_score} | pass_rate={num_correct}/{mc_samples}')
+
+        return probe_scores
+
     def fit(self):
         """
         The training loop of PPO.
@@ -574,7 +764,8 @@ class RayPPOTrainer(object):
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                print(f'epoch {epoch}, step {self.global_steps}')
+                print(f'========== Start step {self.global_steps} ==========')
+                print(f'Epoch {epoch}, step {self.global_steps}')
                 metrics = {}
                 timing_raw = {}
 
@@ -593,6 +784,12 @@ class RayPPOTrainer(object):
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # ── PRM Probe (compute only; metrics logged after reward) ──
+                    _probe_cfg = getattr(self.config, 'probe', None)
+                    if _probe_cfg is not None and _probe_cfg.get('enable', False):
+                        probe_scores = self._run_probe(batch, timing_raw)
+                        batch.batch['probe_scores'] = probe_scores
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
@@ -626,6 +823,38 @@ class RayPPOTrainer(object):
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
+
+                        # ── PRM Probe metrics (now that reward is available) ──
+                        if 'probe_scores' in batch.batch.keys():
+                            probe_scores = batch.batch['probe_scores']
+                            num_truncations = self.config.probe.num_truncations
+                            num_trunc_points = probe_scores.shape[1]
+
+                            # Per-sample reward: sum token_level_scores along seq dim
+                            per_sample_reward = reward_tensor.sum(dim=-1)  # (batch_size,)
+                            correct_mask = (per_sample_reward >= 1.0)
+                            incorrect_mask = ~correct_mask
+                            n_correct = correct_mask.sum().item()
+                            n_incorrect = incorrect_mask.sum().item()
+
+                            overconf_weights = torch.linspace(-0.5, 0.5, num_trunc_points)
+
+                            def _log_probe_group(prefix, scores):
+                                """Log probe metrics for a group of samples."""
+                                if scores.shape[0] == 0:
+                                    return
+                                metrics[f'{prefix}/mean_score'] = scores.mean().item()
+                                for k_idx in range(num_trunc_points):
+                                    frac = k_idx / num_truncations
+                                    metrics[f'{prefix}/score_at_{frac:.2f}'] = scores[:, k_idx].mean().item()
+                                oc = (scores * overconf_weights.unsqueeze(0)).sum(dim=1)
+                                metrics[f'{prefix}/overconf'] = oc.mean().item()
+
+                            _log_probe_group('probe_all', probe_scores)
+                            _log_probe_group('probe_correct', probe_scores[correct_mask])
+                            _log_probe_group('probe_incorrect', probe_scores[incorrect_mask])
+                            metrics['probe_all/n_correct'] = float(n_correct)
+                            metrics['probe_all/n_incorrect'] = float(n_incorrect)
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:
@@ -676,6 +905,11 @@ class RayPPOTrainer(object):
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+
+                # Print metrics to log
+                print(f'[Step {self.global_steps}] Metrics:')
+                for key in sorted(metrics.keys()):
+                    print(f'  {key}: {metrics[key]:.6f}' if isinstance(metrics[key], float) else f'  {key}: {metrics[key]}')
 
                 self.global_steps += 1
 

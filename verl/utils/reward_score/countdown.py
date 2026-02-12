@@ -1,7 +1,7 @@
 import re
-import random
 import ast
 import operator
+import warnings
 
 
 def extract_solution(solution_str):
@@ -50,7 +50,9 @@ def evaluate_equation(equation_str):
             raise ValueError("Invalid characters in equation.")
 
         # Evaluate the equation with restricted globals and locals
-        result = eval(equation_str, {"__builtins__": None}, {})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            result = eval(equation_str, {"__builtins__": None}, {})
         return result
     except Exception as e:
         return None
@@ -70,42 +72,23 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.1,
     numbers = ground_truth['numbers']
     
     equation = extract_solution(solution_str=solution_str)
-    do_print = random.randint(1, 64) == 1
-    
-    if do_print:
-        print(f"--------------------------------")
-        print(f"Target: {target} | Numbers: {numbers}")
-        print(f"Extracted equation: {equation}")
-        print(f"Solution string: {solution_str}")
 
     if equation is None:
-        if do_print:
-            print(f"No equation found")
         return 0
     
     # Validate equation uses correct numbers
     if not validate_equation(equation, numbers):
-        if do_print:
-            print(f"Invalid equation")
         return format_score
         
     # Evaluate equation
     try:
         result = evaluate_equation(equation)
         if result is None:
-            if do_print:
-                print(f"Could not evaluate equation")
             return format_score
             
         if abs(result - target) < 1e-5:  # Account for floating point precision
-            if do_print:
-                print(f"Correct equation: {equation} = {result}")
             return score
         else:
-            if do_print:
-                print(f"Wrong result: equation = {result}, target = {target}")
             return format_score
     except:
-        if do_print:
-            print(f"Error evaluating equation")
         return format_score 

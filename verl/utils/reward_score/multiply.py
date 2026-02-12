@@ -1,5 +1,4 @@
 import re
-import random
 
 
 def extract_solution(solution_str):
@@ -37,22 +36,11 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.1,
         score: the score for the correct answer
     """
     answer = extract_solution(solution_str=solution_str)
-    do_print = random.randint(1, 64) == 1
-    if do_print:
-        print(f"--------------------------------")
-        print(f"Ground truth: {ground_truth} | Extracted answer: {answer}")
-        print(f"Solution string: {solution_str}")
 
     if answer is None:
-        if do_print:
-            print(f"No answer found")
         return 0
     else:
         if int(answer) == int(ground_truth):
-            if do_print:
-                print(f"Correct answer: {answer}")
             return score
         else:
-            if do_print:
-                print(f"Incorrect answer {answer} | Ground truth: {ground_truth}")
             return format_score

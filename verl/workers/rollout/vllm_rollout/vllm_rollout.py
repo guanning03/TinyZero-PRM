@@ -224,3 +224,61 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.free_cache_engine()
 
         return DataProto(batch=batch)
+
+    @torch.no_grad()
+    def generate_probe_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Generate short probe completions for PRM-style evaluation.
+
+        This is a lightweight generation call: no log_prob recomputation,
+        no full sequence construction. We only need the response tokens back
+        so the driver can decode & score them.
+        """
+        if self.config.free_cache_engine:
+            self.inference_engine.init_cache_engine()
+
+        idx = prompts.batch['input_ids']
+        attention_mask = prompts.batch['attention_mask']
+        eos_token_id = prompts.meta_info['eos_token_id']
+
+        batch_size = idx.size(0)
+
+        idx_list = []
+        for i in range(batch_size):
+            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+
+        # Read probe-specific params from meta_info
+        probe_n = prompts.meta_info.get('probe_n', 1)
+        probe_max_tokens = prompts.meta_info.get('probe_max_tokens', 64)
+
+        probe_kwargs = {
+            'n': probe_n,
+            'max_tokens': probe_max_tokens,
+            'temperature': 1.0,
+            'top_p': 1.0,
+            'top_k': -1,
+        }
+
+        with self.update_sampling_params(**probe_kwargs):
+            output = self.inference_engine.generate(
+                prompts=None,
+                sampling_params=self.sampling_params,
+                prompt_token_ids=idx_list,
+                use_tqdm=False)
+
+        # output[0]: (batch_size * probe_n, response_length)
+        response = output[0].to(idx.device)
+
+        if response.shape[1] < probe_max_tokens:
+            response = pad_sequence_to_length(response, probe_max_tokens, self.pad_token_id)
+
+        # Build a minimal output: just the probe responses
+        probe_batch = TensorDict(
+            {
+                'probe_responses': response,  # (batch_size * probe_n, probe_max_tokens)
+            },
+            batch_size=batch_size * probe_n)
+
+        if self.config.free_cache_engine:
+            self.inference_engine.free_cache_engine()
+
+        return DataProto(batch=probe_batch)

@@ -446,6 +446,40 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def generate_probe_sequences(self, prompts: DataProto):
+        """Generate short probe completions for PRM-style evaluation.
+        No log_prob recomputation needed.
+        """
+        prompts = prompts.to('cuda')
+
+        assert self._is_rollout
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+
+        prompts.batch = prompts.batch.cuda()
+        meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
+        prompts.meta_info.update(meta_info)
+        with self.rollout_sharding_manager:
+            log_gpu_memory_usage('After entering rollout sharding manager (probe)', logger=logger)
+
+            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            output = self.rollout.generate_probe_sequences(prompts=prompts)
+
+            log_gpu_memory_usage('After probe generation', logger=logger)
+
+            output = self.rollout_sharding_manager.postprocess_data(output)
+
+        output = output.to('cpu')
+
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage('After probe generation cleanup', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 

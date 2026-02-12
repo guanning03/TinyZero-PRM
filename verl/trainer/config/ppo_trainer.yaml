@@ -144,6 +144,13 @@ algorithm:
     type: fixed
     kl_coef: 0.001
 
+probe:
+  enable: False
+  num_truncations: 10       # number of truncation points along the response
+  mc_samples: 5             # number of MC completions per truncation point
+  mc_max_tokens: 64         # max tokens per probe completion
+  suffix: "</think> Thus, the final answer is <answer> "
+
 trainer:
   total_epochs: 30
   total_training_steps: null

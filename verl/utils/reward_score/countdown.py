@@ -41,20 +41,66 @@ def validate_equation(equation_str, available_numbers):
         return False
 
 
-def evaluate_equation(equation_str):
-    """Safely evaluate the arithmetic equation using eval() with precautions."""
-    try:
-        # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
-        allowed_pattern = r'^[\d+\-*/().\s]+$'
-        if not re.match(allowed_pattern, equation_str):
-            raise ValueError("Invalid characters in equation.")
+def _safe_eval_node(node):
+    """Recursively evaluate an AST node, supporting only +, -, *, / on numbers.
 
-        # Evaluate the equation with restricted globals and locals
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", SyntaxWarning)
-            result = eval(equation_str, {"__builtins__": None}, {})
-        return result
-    except Exception as e:
+    This replaces the previous ``eval()``-based implementation which could hang
+    indefinitely when the model generated expressions containing the ``**``
+    (power) operator — e.g. ``480**782**576`` produces an astronomically large
+    number that Python will spend forever computing.
+
+    By walking the AST ourselves we guarantee:
+    * Only ``+  -  *  /`` (and unary ``-``, ``+``) are allowed.
+    * ``**`` (Pow) and every other operator / construct is rejected immediately.
+    * No risk of code-injection via ``eval()``.
+    """
+    if isinstance(node, ast.Expression):
+        return _safe_eval_node(node.body)
+    elif isinstance(node, ast.Num):          # Python 3.7 compat
+        return node.n
+    elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    elif isinstance(node, ast.BinOp):
+        left = _safe_eval_node(node.left)
+        right = _safe_eval_node(node.right)
+        op_type = type(node.op)
+        if op_type is ast.Add:
+            return left + right
+        elif op_type is ast.Sub:
+            return left - right
+        elif op_type is ast.Mult:
+            return left * right
+        elif op_type is ast.Div:
+            if right == 0:
+                raise ValueError("Division by zero")
+            return left / right
+        else:
+            raise ValueError(f"Unsupported binary operator: {ast.dump(node.op)}")
+    elif isinstance(node, ast.UnaryOp):
+        operand = _safe_eval_node(node.operand)
+        if isinstance(node.op, ast.USub):
+            return -operand
+        elif isinstance(node.op, ast.UAdd):
+            return +operand
+        else:
+            raise ValueError(f"Unsupported unary operator: {ast.dump(node.op)}")
+    else:
+        raise ValueError(f"Unsupported AST node: {ast.dump(node)}")
+
+
+def evaluate_equation(equation_str):
+    """Safely evaluate an arithmetic equation using AST parsing.
+
+    Only supports ``+``, ``-``, ``*``, ``/`` on numeric literals.
+    Returns ``None`` for any invalid / unsupported expression.
+    """
+    try:
+        # Quick sanity: reject extremely long strings
+        if len(equation_str) > 500:
+            return None
+        tree = ast.parse(equation_str, mode='eval')
+        return _safe_eval_node(tree)
+    except Exception:
         return None
 
 

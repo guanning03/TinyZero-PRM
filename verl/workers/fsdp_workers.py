@@ -99,14 +99,25 @@ class ActorRolloutRefWorker(Worker):
                                                         self.ulysses_sequence_parallel_size)
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
             self.config.actor.ppo_micro_batch_size *= self.config.rollout.n
+            # Ensure at least 1 to avoid division by zero error
+            if self.config.actor.ppo_micro_batch_size == 0:
+                self.config.actor.ppo_micro_batch_size = 1
+            if self.config.actor.ppo_mini_batch_size == 0:
+                self.config.actor.ppo_mini_batch_size = 1
         if self._is_rollout:
             self.config.rollout.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                                self.ulysses_sequence_parallel_size)
             self.config.rollout.log_prob_micro_batch_size *= self.config.rollout.n
+            # Ensure at least 1 to avoid split(0) error
+            if self.config.rollout.log_prob_micro_batch_size == 0:
+                self.config.rollout.log_prob_micro_batch_size = 1
         if self._is_ref:
             self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size *= self.config.rollout.n
+            # Ensure at least 1 to avoid split(0) error
+            if self.config.ref.log_prob_micro_batch_size == 0:
+                self.config.ref.log_prob_micro_batch_size = 1
 
     def _build_model_optimizer(self,
                                model_path,

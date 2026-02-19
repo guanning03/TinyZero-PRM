@@ -1,12 +1,13 @@
 export WANDB_API_KEY=256879fdda25bc1fb8ee4f0310e71615e92f75c9
-export HF_TOKEN=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
+export HF_TOKEN=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
 export WANDB_ENTITY=Tsinghua-IIIS-AI-Team
 
-export N_GPUS=2
+export N_GPUS=8
 export BASE_MODEL=/home/azanette/TinyZero-PRM/checkpoints/base_models/Qwen2.5-3B
-export DATA_DIR=data
-export ROLLOUT_TP_SIZE=2
-export EXPERIMENT_NAME=countdown-qwen2.5-3b
+export BASE_DATA_DIR=${1:-count_down_327680_3_3700_7400}
+DATA_DIR=countdown-data/${BASE_DATA_DIR}
+export ROLLOUT_TP_SIZE=1
+export EXPERIMENT_NAME=3b-${BASE_DATA_DIR}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
 python3 -m verl.trainer.main_ppo \
@@ -21,7 +22,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=4 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=8 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -29,12 +30,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.grad_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size=4 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=5 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size=2 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
@@ -52,4 +53,8 @@ python3 -m verl.trainer.main_ppo \
     probe.num_truncations=5 \
     probe.mc_samples=10 \
     probe.mc_max_tokens=32 \
+    probe.num_splits=8 \
+    reward.use_pool=True \
+    reward.num_workers=4 \
+    reward.timeout=120 \
     2>&1 | tee verl_demo.log

@@ -303,7 +303,8 @@ class RayPPOTrainer(object):
                  resource_pool_manager: ResourcePoolManager,
                  ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
                  reward_fn=None,
-                 val_reward_fn=None):
+                 val_reward_fn=None,
+                 shared_pool=None):
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
@@ -311,6 +312,16 @@ class RayPPOTrainer(object):
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+
+        # Use the shared scoring pool passed from main_task (if any)
+        reward_cfg = config.get('reward', {})
+        if shared_pool is not None:
+            self._score_pool = shared_pool
+            self._score_pool_timeout = reward_cfg.get('timeout', 120)
+            print(f"[RayPPOTrainer] Using shared scoring pool for probe (timeout={self._score_pool_timeout}s)")
+        else:
+            self._score_pool = None
+            self._score_pool_timeout = 120
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
@@ -545,46 +556,37 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
-    def _run_probe(self, batch: DataProto, timing_raw: Dict[str, float]) -> torch.Tensor:
-        """Run faithfulness probe per probe.md:
-        1. Extract CoT (tokens between <think> and </think>) from each response
-        2. Truncate only the CoT at fractions 0/N, 1/N, ..., N/N
-        3. Construct: [prompt] + [response up to <think>] + [partial CoT] + [suffix]
-           where suffix = "</think> Thus, the final answer is <answer> "
-        4. Generate MC completions and score them
+    def _run_probe_single_batch(self, sub_batch: DataProto, batch_start_idx: int, 
+                                 probe_cfg, tokenizer, pad_token_id, suffix_ids, 
+                                 think_open_ids, think_close_ids, timing_raw) -> torch.Tensor:
+        """Run probe on a single sub-batch. Internal helper for _run_probe.
 
         Args:
-            batch: the current training batch (after repeat & union with gen_batch_output)
+            sub_batch: a subset of the full batch
+            batch_start_idx: the starting index of this sub-batch in the original batch
+            probe_cfg: probe configuration
+            tokenizer: tokenizer instance
+            pad_token_id: padding token ID
+            suffix_ids: encoded suffix tokens
+            think_open_ids: encoded <think> tokens
+            think_close_ids: encoded </think> tokens
             timing_raw: dict to record probe_gen and probe_reward timings
 
         Returns:
-            probe_scores: Tensor of shape (batch_size, num_truncations + 1) where each
-                          value is the fraction of MC samples that got the correct answer.
-                          Columns correspond to CoT fractions 0/N, 1/N, ..., N/N (inclusive).
+            probe_scores: Tensor of shape (sub_batch_size, num_truncations + 1)
         """
-        probe_cfg = self.config.probe
         num_truncations = probe_cfg.num_truncations
         mc_samples = probe_cfg.mc_samples
         mc_max_tokens = probe_cfg.mc_max_tokens
         suffix_str = probe_cfg.suffix
 
-        tokenizer = self.tokenizer
-        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-        # Encode boundary tokens
-        suffix_ids = tokenizer.encode(suffix_str, add_special_tokens=False)
-        suffix_ids = torch.tensor(suffix_ids, dtype=torch.long)
-        think_open_ids = torch.tensor(
-            tokenizer.encode("<think>", add_special_tokens=False), dtype=torch.long)
-        think_close_ids = torch.tensor(
-            tokenizer.encode("</think>", add_special_tokens=False), dtype=torch.long)
-
-        batch_size = len(batch)
+        sub_batch_size = len(sub_batch)
+        num_trunc_points = num_truncations + 1
 
         # ── 1. Extract valid prompt & response tokens for each sample ──
-        prompt_all = batch.batch['prompts']         # (B, prompt_max_len) - left padded
-        response_all = batch.batch['responses']     # (B, response_max_len) - right padded
-        attention_mask = batch.batch['attention_mask']  # (B, prompt_max_len + response_max_len)
+        prompt_all = sub_batch.batch['prompts']
+        response_all = sub_batch.batch['responses']
+        attention_mask = sub_batch.batch['attention_mask']
         prompt_max_len = prompt_all.shape[1]
 
         prompt_mask = attention_mask[:, :prompt_max_len]
@@ -602,9 +604,8 @@ class RayPPOTrainer(object):
 
         # ── 2. Find CoT boundaries & build probe prompts ──
         all_probe_token_ids = []
-        cot_boundaries = []  # (cot_start, cot_end) per sample — indices into response
 
-        for i in range(batch_size):
+        for i in range(sub_batch_size):
             vpl = valid_prompt_lengths[i].item()
             vrl = valid_response_lengths[i].item()
 
@@ -616,19 +617,18 @@ class RayPPOTrainer(object):
             if think_s >= 0:
                 cot_start = think_s + len(think_open_ids)
             else:
-                cot_start = 0  # no <think> found; treat response start as CoT start
+                cot_start = 0
 
             # Find </think> → cot_end is the index of the FIRST token of </think>
             think_e = _find_token_seq(valid_response, think_close_ids)
             if think_e >= 0:
                 cot_end = think_e
             else:
-                cot_end = vrl  # no </think>; treat rest of response as CoT
+                cot_end = vrl
 
-            cot_boundaries.append((cot_start, cot_end))
             cot_len = cot_end - cot_start
 
-            if i == 0:
+            if batch_start_idx + i == 0:
                 cot_text_preview = tokenizer.decode(
                     valid_response[cot_start:min(cot_start + 30, cot_end)],
                     skip_special_tokens=False)
@@ -638,15 +638,13 @@ class RayPPOTrainer(object):
 
             for k in range(num_truncations + 1):
                 cot_trunc = round(cot_len * k / num_truncations)
-                # [prompt] + [response[:cot_start] (includes <think>)] + [CoT[:trunc]] + [suffix]
                 trunc_end = cot_start + cot_trunc
                 truncated_response = valid_response[:trunc_end]
                 probe_tokens = torch.cat([valid_prompt, truncated_response, suffix_ids], dim=0)
                 all_probe_token_ids.append(probe_tokens)
 
         # ── 3. Pad to uniform length (left-pad) and build attention_mask, position_ids ──
-        num_trunc_points = num_truncations + 1
-        num_probes = len(all_probe_token_ids)  # batch_size * num_trunc_points
+        num_probes = len(all_probe_token_ids)
         max_probe_len = max(t.shape[0] for t in all_probe_token_ids)
 
         padded_input_ids = torch.full((num_probes, max_probe_len), pad_token_id, dtype=torch.long)
@@ -680,57 +678,206 @@ class RayPPOTrainer(object):
         # ── probe_gen: vLLM generation ──
         with _timer('probe_gen', timing_raw):
             probe_data_padded, probe_pad_size = pad_dataproto_to_divisor(probe_data, self.actor_rollout_wg.world_size)
-            print(f'[Probe] Sending {num_probes} probe prompts (padded to {len(probe_data_padded)}) '
-                  f'× {mc_samples} MC samples to vLLM')
+            print(f'[Probe] Generating {num_probes} probe prompts (padded to {len(probe_data_padded)}) '
+                  f'× {mc_samples} MC samples for sub-batch (samples {batch_start_idx}-{batch_start_idx + sub_batch_size - 1})')
             probe_output_padded = self.actor_rollout_wg.generate_probe_sequences(probe_data_padded)
             probe_output = unpad_dataproto(probe_output_padded, pad_size=probe_pad_size)
-            print(f'[Probe] Generation complete')
+            print(f'[Probe] Generation complete for sub-batch (samples {batch_start_idx}-{batch_start_idx + sub_batch_size - 1})')
+            
+            # Release GPU memory after generation
+            del probe_data_padded, probe_output_padded, probe_data
+            torch.cuda.empty_cache()
 
         # ── probe_reward: scoring ──
         with _timer('probe_reward', timing_raw):
+            print(f'[Probe] Computing rewards for sub-batch (samples {batch_start_idx}-{batch_start_idx + sub_batch_size - 1})...')
             probe_responses = probe_output.batch['probe_responses']
-            probe_scores = torch.zeros(batch_size, num_trunc_points, dtype=torch.float32)
+            probe_scores = torch.zeros(sub_batch_size, num_trunc_points, dtype=torch.float32)
 
-            from verl.trainer.main_ppo import _select_rm_score_fn
+            # --- Step A: Decode all probe responses in the main process (fast, CPU) ---
+            import time as _time
+            t_decode_start = _time.time()
 
-            for i in range(batch_size):
-                data_source = batch.non_tensor_batch['data_source'][i]
-                ground_truth = batch.non_tensor_batch['reward_model'][i]['ground_truth']
-                compute_score_fn = _select_rm_score_fn(data_source)
+            # Pre-collect per-sample metadata
+            sample_data_sources = []
+            sample_ground_truths = []
+            for i in range(sub_batch_size):
+                sample_data_sources.append(sub_batch.non_tensor_batch['data_source'][i])
+                sample_ground_truths.append(sub_batch.non_tensor_batch['reward_model'][i]['ground_truth'])
 
-                if i == 0:
+            # Build flat list of scoring tasks: one per (sample, trunc, mc)
+            total_tasks = sub_batch_size * num_trunc_points * mc_samples
+            scoring_args = []          # (data_source, solution_str, ground_truth)
+            debug_first_gen = {}       # (i, k) -> gen_str for first MC sample (debug printing)
+
+            for i in range(sub_batch_size):
+                data_source = sample_data_sources[i]
+                ground_truth = sample_ground_truths[i]
+                orig_idx = batch_start_idx + i
+
+                if orig_idx == 0:
                     print(f'[Probe debug] sample 0: ground_truth={ground_truth}')
 
                 for k in range(num_trunc_points):
                     probe_idx = i * num_trunc_points + k
                     start_row = probe_idx * mc_samples
-                    end_row = start_row + mc_samples
 
-                    num_correct = 0
-                    first_gen_str = None
-                    first_score = None
-                    for m in range(start_row, end_row):
-                        gen_ids = probe_responses[m]
+                    for m_offset in range(mc_samples):
+                        gen_ids = probe_responses[start_row + m_offset]
                         gen_mask = (gen_ids != pad_token_id)
                         valid_gen_ids = gen_ids[gen_mask]
                         gen_str = tokenizer.decode(valid_gen_ids, skip_special_tokens=False)
 
-                        # Build a CLEAN solution string for the verifier,
-                        # avoiding CoT content that may contain stray <answer> tags.
                         clean_solution = f"<|im_start|>assistant\n{suffix_str}{gen_str}"
-                        score = compute_score_fn(solution_str=clean_solution, ground_truth=ground_truth, format_score=0)
-                        if m == start_row:
-                            first_gen_str = gen_str
-                            first_score = score
-                        if score >= 1.0:
+                        scoring_args.append((data_source, clean_solution, ground_truth))
+
+                        if m_offset == 0:
+                            debug_first_gen[(i, k)] = gen_str
+
+            t_decode = _time.time() - t_decode_start
+
+            # --- Step B: Score all tasks (parallel via pool, or sequential fallback) ---
+            t_score_start = _time.time()
+
+            if self._score_pool is not None:
+                from verl.trainer.main_ppo import _pool_compute_probe_score
+                chunksize = max(1, total_tasks // 64)  # reasonable chunk size
+                try:
+                    async_result = self._score_pool.map_async(
+                        _pool_compute_probe_score, scoring_args, chunksize=chunksize)
+                    all_scores = async_result.get(timeout=self._score_pool_timeout)
+                    scoring_method = 'pool'
+                except Exception as e:
+                    print(f'[Probe] WARNING: Pool scoring failed ({e}), falling back to sequential')
+                    all_scores = [_pool_compute_probe_score(a) for a in scoring_args]
+                    scoring_method = 'sequential(fallback)'
+            else:
+                from verl.trainer.main_ppo import _select_rm_score_fn
+                all_scores = []
+                for ds, sol, gt in scoring_args:
+                    fn = _select_rm_score_fn(ds)
+                    s = fn(solution_str=sol, ground_truth=gt, format_score=0)
+                    all_scores.append(float(s) if isinstance(s, (int, float, bool)) else 0.0)
+                scoring_method = 'sequential'
+
+            t_score = _time.time() - t_score_start
+
+            # --- Step C: Aggregate scores into probe_scores tensor ---
+            score_idx = 0
+            for i in range(sub_batch_size):
+                orig_idx = batch_start_idx + i
+                for k in range(num_trunc_points):
+                    num_correct = 0
+                    first_score = None
+                    for m_offset in range(mc_samples):
+                        s = all_scores[score_idx]
+                        if m_offset == 0:
+                            first_score = s
+                        if s >= 1.0:
                             num_correct += 1
+                        score_idx += 1
 
                     probe_scores[i, k] = num_correct / mc_samples
 
-                    # Print one example per truncation point for the first sample
-                    if i == 0:
+                    if orig_idx == 0:
                         frac = k / num_truncations
+                        first_gen_str = debug_first_gen.get((i, k), '')
                         print(f'  [Probe sample 0] trunc={frac:.1f} | gen: {first_gen_str!r} | score={first_score} | pass_rate={num_correct}/{mc_samples}')
+
+            # Release GPU memory after scoring
+            del probe_output, probe_responses
+            torch.cuda.empty_cache()
+            print(f'[Probe] Reward scoring complete for sub-batch (samples {batch_start_idx}-{batch_start_idx + sub_batch_size - 1}): '
+                  f'{total_tasks} tasks, method={scoring_method}, decode={t_decode:.3f}s, score={t_score:.3f}s')
+
+        return probe_scores
+
+    def _run_probe(self, batch: DataProto, timing_raw: Dict[str, float]) -> torch.Tensor:
+        """Run faithfulness probe per probe.md:
+        1. Extract CoT (tokens between <think> and </think>) from each response
+        2. Truncate only the CoT at fractions 0/N, 1/N, ..., N/N
+        3. Construct: [prompt] + [response up to <think>] + [partial CoT] + [suffix]
+           where suffix = "</think> Thus, the final answer is <answer> "
+        4. Generate MC completions and score them
+        
+        Supports splitting the batch into K sub-batches to reduce memory usage.
+
+        Args:
+            batch: the current training batch (after repeat & union with gen_batch_output)
+            timing_raw: dict to record probe_gen and probe_reward timings
+
+        Returns:
+            probe_scores: Tensor of shape (batch_size, num_truncations + 1) where each
+                          value is the fraction of MC samples that got the correct answer.
+                          Columns correspond to CoT fractions 0/N, 1/N, ..., N/N (inclusive).
+        """
+        probe_cfg = self.config.probe
+        num_splits = probe_cfg.get('num_splits', 1)  # Default to 1 (no splitting)
+        
+        batch_size = len(batch)
+        
+        # If num_splits is 1 or batch_size is too small, run normally
+        if num_splits <= 1 or batch_size < num_splits:
+            num_splits = 1
+        
+        tokenizer = self.tokenizer
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        suffix_str = probe_cfg.suffix
+
+        # Encode boundary tokens (only once)
+        suffix_ids = tokenizer.encode(suffix_str, add_special_tokens=False)
+        suffix_ids = torch.tensor(suffix_ids, dtype=torch.long)
+        think_open_ids = torch.tensor(
+            tokenizer.encode("<think>", add_special_tokens=False), dtype=torch.long)
+        think_close_ids = torch.tensor(
+            tokenizer.encode("</think>", add_special_tokens=False), dtype=torch.long)
+
+        if num_splits == 1:
+            # Original behavior: process entire batch at once
+            return self._run_probe_single_batch(
+                batch, 0, probe_cfg, tokenizer, pad_token_id, 
+                suffix_ids, think_open_ids, think_close_ids, timing_raw
+            )
+        
+        # Split batch into K sub-batches using chunk method
+        assert batch_size % num_splits == 0, f"batch_size ({batch_size}) must be divisible by num_splits ({num_splits})"
+        
+        num_trunc_points = probe_cfg.num_truncations + 1
+        all_probe_scores = []
+        
+        sub_batch_size = batch_size // num_splits
+        print(f'[Probe] Splitting batch of {batch_size} samples into {num_splits} sub-batches of {sub_batch_size} samples each')
+        
+        # Use chunk method to split the batch
+        sub_batches = batch.chunk(chunks=num_splits)
+        
+        for split_idx in range(num_splits):
+            sub_batch = sub_batches[split_idx]
+            start_idx = split_idx * sub_batch_size
+            
+            print(f'[Probe] Processing sub-batch {split_idx + 1}/{num_splits} (samples {start_idx}-{start_idx + sub_batch_size - 1})')
+            
+            # Process this sub-batch
+            sub_probe_scores = self._run_probe_single_batch(
+                sub_batch, start_idx, probe_cfg, tokenizer, pad_token_id,
+                suffix_ids, think_open_ids, think_close_ids, timing_raw
+            )
+            
+            all_probe_scores.append(sub_probe_scores)
+            
+            # Release sub-batch memory
+            del sub_batch
+            torch.cuda.empty_cache()
+            
+            print(f'[Probe] Finished split {split_idx + 1}/{num_splits}')
+        
+        # Concatenate all results
+        print(f'[Probe] Concatenating results from all {num_splits} sub-batches...')
+        probe_scores = torch.cat(all_probe_scores, dim=0)
+        assert probe_scores.shape == (batch_size, num_trunc_points), \
+            f"Expected shape ({batch_size}, {num_trunc_points}), got {probe_scores.shape}"
+        
+        print(f'[Probe] Completed all {num_splits} sub-batches. Final probe_scores shape: {probe_scores.shape}')
 
         return probe_scores
 
@@ -764,7 +911,9 @@ class RayPPOTrainer(object):
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                print(f'========== Start step {self.global_steps} ==========')
+                import datetime as _dt
+                _now = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f'========== Start step {self.global_steps} [{_now}] ==========')
                 print(f'Epoch {epoch}, step {self.global_steps}')
                 metrics = {}
                 timing_raw = {}
@@ -907,7 +1056,8 @@ class RayPPOTrainer(object):
                 logger.log(data=metrics, step=self.global_steps)
 
                 # Print metrics to log
-                print(f'[Step {self.global_steps}] Metrics:')
+                _now_end = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f'[Step {self.global_steps}] Metrics [{_now_end}]:')
                 for key in sorted(metrics.keys()):
                     print(f'  {key}: {metrics[key]:.6f}' if isinstance(metrics[key], float) else f'  {key}: {metrics[key]}')
 

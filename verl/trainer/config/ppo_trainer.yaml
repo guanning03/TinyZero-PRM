@@ -144,12 +144,18 @@ algorithm:
     type: fixed
     kl_coef: 0.001
 
+reward:
+  use_pool: False             # use PoolRewardManager for parallel scoring
+  num_workers: 4              # number of worker processes in the SHARED pool (all scoring paths share 1 pool)
+  timeout: 120                # per-batch timeout in seconds; falls back to sequential if exceeded
+
 probe:
   enable: False
   num_truncations: 10       # number of truncation points along the response
   mc_samples: 5             # number of MC completions per truncation point
   mc_max_tokens: 64         # max tokens per probe completion
   suffix: "</think> Thus, the final answer is <answer> "
+  num_splits: 1             # split batch into K sub-batches to reduce memory usage (must divide batch_size)
 
 trainer:
   total_epochs: 30

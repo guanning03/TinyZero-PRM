@@ -156,6 +156,7 @@ probe:
   mc_max_tokens: 64         # max tokens per probe completion
   suffix: "</think> Thus, the final answer is <answer> "
   num_splits: 1             # split batch into K sub-batches to reduce memory usage (must divide batch_size)
+  overconf_coeff: 0.0       # coefficient for overconfidence penalty subtracted from reward (0 = disabled)
 
 trainer:
   total_epochs: 30

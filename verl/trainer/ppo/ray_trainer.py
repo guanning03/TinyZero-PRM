@@ -39,6 +39,71 @@ from verl.utils.model import compute_position_id_with_mask
 WorkerType = Type[Worker]
 
 
+# ── Probe helpers (module-level for testability) ──────────────────────────────
+
+def find_token_seq(tokens: 'torch.Tensor', pattern: 'torch.Tensor') -> int:
+    """Find first occurrence of *pattern* in *tokens*.
+
+    Both arguments are 1-D ``torch.Tensor`` of token IDs.
+    Returns the starting index, or ``-1`` if not found.
+    """
+    import torch
+    plen = len(pattern)
+    for pos in range(len(tokens) - plen + 1):
+        if torch.equal(tokens[pos:pos + plen], pattern):
+            return pos
+    return -1
+
+
+def find_cot_boundaries(
+    valid_response: 'torch.Tensor',
+    think_open_ids: 'torch.Tensor',
+    think_close_ids: 'torch.Tensor',
+    answer_open_ids: 'torch.Tensor',
+):
+    """Detect CoT start / end inside a response token sequence.
+
+    Returns ``(cot_start, cot_end, boundary_tag)`` where:
+
+    * **cot_start** – index of the first CoT token (right after ``<think>``
+      if present, otherwise 0).
+    * **cot_end** – index one-past the last CoT token.  Determined by the
+      first boundary marker found in priority order:
+
+      1. ``</think>`` → standard case.
+      2. ``<answer>`` → fallback when the prompt already ends with ``<think>``
+         and the model never generates ``</think>``.
+      3. full response length → last resort.
+
+    * **boundary_tag** – human-readable label indicating which boundary was
+      used (useful for logging / debugging).
+    """
+    vrl = len(valid_response)
+
+    # ── cot_start ──
+    think_s = find_token_seq(valid_response, think_open_ids)
+    if think_s >= 0:
+        cot_start = think_s + len(think_open_ids)
+    else:
+        cot_start = 0
+
+    # ── cot_end ──
+    think_e = find_token_seq(valid_response, think_close_ids)
+    if think_e >= 0:
+        cot_end = think_e
+        boundary_tag = '</think>'
+    else:
+        answer_s = find_token_seq(valid_response, answer_open_ids)
+        if answer_s >= 0:
+            cot_end = answer_s
+            boundary_tag = '<answer>(fallback)'
+        else:
+            cot_end = vrl
+            boundary_tag = 'none(full response)'
+
+    return cot_start, cot_end, boundary_tag
+
+
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -558,7 +623,8 @@ class RayPPOTrainer(object):
 
     def _run_probe_single_batch(self, sub_batch: DataProto, batch_start_idx: int, 
                                  probe_cfg, tokenizer, pad_token_id, suffix_ids, 
-                                 think_open_ids, think_close_ids, timing_raw) -> torch.Tensor:
+                                 think_open_ids, think_close_ids, answer_open_ids,
+                                 timing_raw) -> torch.Tensor:
         """Run probe on a single sub-batch. Internal helper for _run_probe.
 
         Args:
@@ -570,6 +636,7 @@ class RayPPOTrainer(object):
             suffix_ids: encoded suffix tokens
             think_open_ids: encoded <think> tokens
             think_close_ids: encoded </think> tokens
+            answer_open_ids: encoded <answer> tokens (fallback CoT boundary)
             timing_raw: dict to record probe_gen and probe_reward timings
 
         Returns:
@@ -594,14 +661,6 @@ class RayPPOTrainer(object):
         valid_prompt_lengths = prompt_mask.sum(dim=1).long()
         valid_response_lengths = response_mask.sum(dim=1).long()
 
-        def _find_token_seq(tokens, pattern):
-            """Find first occurrence of token pattern in tokens. Returns index or -1."""
-            plen = len(pattern)
-            for pos in range(len(tokens) - plen + 1):
-                if torch.equal(tokens[pos:pos + plen], pattern):
-                    return pos
-            return -1
-
         # ── 2. Find CoT boundaries & build probe prompts ──
         all_probe_token_ids = []
 
@@ -612,19 +671,8 @@ class RayPPOTrainer(object):
             valid_prompt = prompt_all[i, prompt_max_len - vpl:]
             valid_response = response_all[i, :vrl]
 
-            # Find <think> → cot_start is the index right AFTER <think> tokens
-            think_s = _find_token_seq(valid_response, think_open_ids)
-            if think_s >= 0:
-                cot_start = think_s + len(think_open_ids)
-            else:
-                cot_start = 0
-
-            # Find </think> → cot_end is the index of the FIRST token of </think>
-            think_e = _find_token_seq(valid_response, think_close_ids)
-            if think_e >= 0:
-                cot_end = think_e
-            else:
-                cot_end = vrl
+            cot_start, cot_end, boundary_tag = find_cot_boundaries(
+                valid_response, think_open_ids, think_close_ids, answer_open_ids)
 
             cot_len = cot_end - cot_start
 
@@ -633,7 +681,7 @@ class RayPPOTrainer(object):
                     valid_response[cot_start:min(cot_start + 30, cot_end)],
                     skip_special_tokens=False)
                 print(f'[Probe] sample 0: cot_start={cot_start}, cot_end={cot_end}, '
-                      f'cot_len={cot_len}, response_len={vrl}')
+                      f'cot_len={cot_len}, response_len={vrl}, boundary={boundary_tag}')
                 print(f'  CoT preview: {cot_text_preview!r}...')
 
             for k in range(num_truncations + 1):
@@ -793,10 +841,13 @@ class RayPPOTrainer(object):
         return probe_scores
 
     def _run_probe(self, batch: DataProto, timing_raw: Dict[str, float]) -> torch.Tensor:
-        """Run faithfulness probe per probe.md:
-        1. Extract CoT (tokens between <think> and </think>) from each response
+        """Run faithfulness probe:
+        1. Extract CoT from each response. The CoT boundary is determined by:
+           - Primary: tokens between <think> and </think>
+           - Fallback: tokens before <answer> (when </think> is not in the
+             response, e.g. because the prompt already ends with <think>)
         2. Truncate only the CoT at fractions 0/N, 1/N, ..., N/N
-        3. Construct: [prompt] + [response up to <think>] + [partial CoT] + [suffix]
+        3. Construct: [prompt] + [response up to boundary] + [partial CoT] + [suffix]
            where suffix = "</think> Thus, the final answer is <answer> "
         4. Generate MC completions and score them
         
@@ -831,12 +882,15 @@ class RayPPOTrainer(object):
             tokenizer.encode("<think>", add_special_tokens=False), dtype=torch.long)
         think_close_ids = torch.tensor(
             tokenizer.encode("</think>", add_special_tokens=False), dtype=torch.long)
+        answer_open_ids = torch.tensor(
+            tokenizer.encode("<answer>", add_special_tokens=False), dtype=torch.long)
 
         if num_splits == 1:
             # Original behavior: process entire batch at once
             return self._run_probe_single_batch(
                 batch, 0, probe_cfg, tokenizer, pad_token_id, 
-                suffix_ids, think_open_ids, think_close_ids, timing_raw
+                suffix_ids, think_open_ids, think_close_ids, answer_open_ids,
+                timing_raw
             )
         
         # Split batch into K sub-batches using chunk method
@@ -860,7 +914,8 @@ class RayPPOTrainer(object):
             # Process this sub-batch
             sub_probe_scores = self._run_probe_single_batch(
                 sub_batch, start_idx, probe_cfg, tokenizer, pad_token_id,
-                suffix_ids, think_open_ids, think_close_ids, timing_raw
+                suffix_ids, think_open_ids, think_close_ids, answer_open_ids,
+                timing_raw
             )
             
             all_probe_scores.append(sub_probe_scores)
@@ -986,7 +1041,7 @@ class RayPPOTrainer(object):
                             n_correct = correct_mask.sum().item()
                             n_incorrect = incorrect_mask.sum().item()
 
-                            overconf_weights = torch.linspace(-0.5, 0.5, num_trunc_points)
+                            overconf_weights = torch.linspace(0.5, -0.5, num_trunc_points)
 
                             def _log_probe_group(prefix, scores):
                                 """Log probe metrics for a group of samples."""
@@ -1004,6 +1059,29 @@ class RayPPOTrainer(object):
                             _log_probe_group('probe_incorrect', probe_scores[incorrect_mask])
                             metrics['probe_all/n_correct'] = float(n_correct)
                             metrics['probe_all/n_incorrect'] = float(n_incorrect)
+
+                            # ── Overconfidence penalty on reward ──
+                            overconf_coeff = getattr(self.config.probe, 'overconf_coeff', 0.0)
+                            if overconf_coeff != 0.0:
+                                # Per-sample overconf: weighted sum of probe scores
+                                oc_per_sample = (probe_scores * overconf_weights.unsqueeze(0)).sum(dim=1)  # (batch_size,)
+                                penalty = overconf_coeff * oc_per_sample  # (batch_size,)
+
+                                # Subtract penalty at the last valid token of each sample
+                                # (same position where the original reward is placed)
+                                response_length = batch.batch['responses'].shape[-1]
+                                attention_mask = batch.batch['attention_mask']
+                                response_mask = attention_mask[:, -response_length:]
+                                # last valid token index within response for each sample
+                                last_valid_idx = response_mask.sum(dim=-1).long() - 1  # (batch_size,)
+                                last_valid_idx = last_valid_idx.clamp(min=0)
+                                reward_tensor[torch.arange(reward_tensor.shape[0], device=reward_tensor.device), last_valid_idx] -= penalty.to(reward_tensor.device)
+                                # Update token_level_scores with the penalised reward
+                                batch.batch['token_level_scores'] = reward_tensor
+
+                                metrics['probe_all/overconf_penalty_mean'] = penalty.mean().item()
+                                metrics['probe_all/overconf_penalty_abs_mean'] = penalty.abs().mean().item()
+                                metrics['probe_all/overconf_coeff'] = overconf_coeff
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:

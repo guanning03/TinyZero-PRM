@@ -1,13 +1,29 @@
+#!/bin/bash
+#SBATCH --job-name=tinyzero-prm
+#SBATCH --partition=production
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=64
+#SBATCH --gres=gpu:8
+#SBATCH --mem=0
+#SBATCH --output=logs/slurm-%j.log
+#SBATCH --error=logs/slurm-%j.log
+
+# ── Activate conda environment ──
+source /home/azanette/miniconda3/etc/profile.d/conda.sh
+conda activate tinyzero
+
 export WANDB_API_KEY=256879fdda25bc1fb8ee4f0310e71615e92f75c9
 export HF_TOKEN=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
 export WANDB_ENTITY=Tsinghua-IIIS-AI-Team
 
 export N_GPUS=8
+export OVERCONF_COEFF=${2:-0.0}
 export BASE_MODEL=/home/azanette/TinyZero-PRM/checkpoints/base_models/Qwen2.5-3B
 export BASE_DATA_DIR=${1:-count_down_327680_3_3700_7400}
 DATA_DIR=countdown-data/${BASE_DATA_DIR}
 export ROLLOUT_TP_SIZE=1
-export EXPERIMENT_NAME=3b-${BASE_DATA_DIR}
+export EXPERIMENT_NAME=3b_rloo_${BASE_DATA_DIR}_coeff_${OVERCONF_COEFF}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
 python3 -m verl.trainer.main_ppo \
@@ -44,17 +60,18 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
+    trainer.save_freq=400 \
     trainer.test_freq=10 \
-    trainer.project_name=TinyZero-PRM-Debug-Guanning \
+    trainer.project_name=TinyZero-PRM-Design1 \
     trainer.experiment_name=$EXPERIMENT_NAME \
-    trainer.total_epochs=15 \
+    trainer.total_epochs=9999 \
+    trainer.total_training_steps=402 \
+    probe.overconf_coeff=$OVERCONF_COEFF \
     probe.enable=True \
     probe.num_truncations=5 \
     probe.mc_samples=10 \
     probe.mc_max_tokens=32 \
-    probe.num_splits=8 \
+    probe.num_splits=1 \
     reward.use_pool=True \
     reward.num_workers=4 \
-    reward.timeout=120 \
-    2>&1 | tee verl_demo.log
+    reward.timeout=120 

@@ -388,15 +388,15 @@ def main_task(config):
         # Create ONE shared pool for ALL scoring (train reward, val reward, probe reward)
         shared_pool = create_shared_scoring_pool(num_workers=num_workers)
         print(f"[main] Using PoolRewardManager (shared pool, workers={num_workers}, timeout={timeout}s)")
-        reward_fn = PoolRewardManager(tokenizer=tokenizer, num_examine=0,
+        reward_fn = PoolRewardManager(tokenizer=tokenizer, num_examine=10,
                                       pool=shared_pool, num_workers=num_workers, timeout=timeout)
-        val_reward_fn = PoolRewardManager(tokenizer=tokenizer, num_examine=0,
+        val_reward_fn = PoolRewardManager(tokenizer=tokenizer, num_examine=10,
                                           pool=shared_pool, num_workers=num_workers, timeout=timeout)
     else:
         print("[main] Using sequential RewardManager")
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=10)
     # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=10)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

@@ -1,0 +1,26 @@
+2026-02-19 14:51:41,321	INFO worker.py:2007 -- Started a local Ray instance.
+/home/azanette/miniconda3/envs/tinyzero/lib/python3.10/site-packages/ray/_private/worker.py:2046: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+[36m(main_task pid=3444880)[0m /home/azanette/miniconda3/envs/tinyzero/lib/python3.10/site-packages/vllm/connections.py:8: RuntimeWarning: Failed to read commit hash:
+[36m(main_task pid=3444880)[0m No module named 'vllm._version'
+[36m(main_task pid=3444880)[0m   from vllm.version import __version__ as VLLM_VERSION
+Error executing job with overrides: ['algorithm.adv_estimator=rloo', 'data.train_files=countdown-data/count_down_327680_4_30_100/train.parquet', 'data.val_files=countdown-data/count_down_327680_4_30_100/test.parquet', 'data.train_batch_size=128', 'data.val_batch_size=640', 'data.max_prompt_length=256', 'data.max_response_length=1024', 'actor_rollout_ref.model.path=/home/azanette/TinyZero-PRM/checkpoints/base_models/Qwen2.5-3B', 'actor_rollout_ref.actor.optim.lr=1e-6', 'actor_rollout_ref.model.use_remove_padding=True', 'actor_rollout_ref.actor.ppo_mini_batch_size=64', 'actor_rollout_ref.actor.ppo_micro_batch_size=8', 'actor_rollout_ref.actor.use_kl_loss=True', 'actor_rollout_ref.actor.kl_loss_coef=0.001', 'actor_rollout_ref.actor.kl_loss_type=low_var_kl', 'actor_rollout_ref.model.enable_gradient_checkpointing=True', 'actor_rollout_ref.actor.fsdp_config.param_offload=False', 'actor_rollout_ref.actor.fsdp_config.grad_offload=False', 'actor_rollout_ref.actor.fsdp_config.optimizer_offload=False', 'actor_rollout_ref.rollout.log_prob_micro_batch_size=8', 'actor_rollout_ref.rollout.tensor_model_parallel_size=1', 'actor_rollout_ref.rollout.name=vllm', 'actor_rollout_ref.rollout.gpu_memory_utilization=0.7', 'actor_rollout_ref.rollout.n=5', 'actor_rollout_ref.ref.log_prob_micro_batch_size=8', 'actor_rollout_ref.ref.fsdp_config.param_offload=True', 'algorithm.kl_ctrl.kl_coef=0.001', 'trainer.critic_warmup=0', 'trainer.logger=[wandb]', '+trainer.val_before_train=True', 'trainer.default_hdfs_dir=null', 'trainer.n_gpus_per_node=8', 'trainer.nnodes=1', 'trainer.save_freq=400', 'trainer.test_freq=10', 'trainer.project_name=TinyZero-PRM-Design1', 'trainer.experiment_name=3b_rloo_count_down_327680_4_30_100_coeff_0.1', 'trainer.total_epochs=9999', 'trainer.total_training_steps=402', 'probe.overconf_coeff=0.1', 'probe.enable=True', 'probe.num_truncations=5', 'probe.mc_samples=10', 'probe.mc_max_tokens=32', 'probe.num_splits=1', 'reward.use_pool=True', 'reward.num_workers=4', 'reward.timeout=120']
+Traceback (most recent call last):
+  File "/data/home/azanette/TinyZero-PRM/verl/trainer/main_ppo.py", line 309, in main
+    ray.get(main_task.remote(config))
+  File "/home/azanette/miniconda3/envs/tinyzero/lib/python3.10/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/home/azanette/miniconda3/envs/tinyzero/lib/python3.10/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    return func(*args, **kwargs)
+  File "/home/azanette/miniconda3/envs/tinyzero/lib/python3.10/site-packages/ray/_private/worker.py", line 2967, in get
+    values, debugger_breakpoint = worker.get_objects(
+  File "/home/azanette/miniconda3/envs/tinyzero/lib/python3.10/site-packages/ray/_private/worker.py", line 1015, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(NotImplementedError): [36mray::main_task()[39m (pid=3444880, ip=10.245.218.209)
+  File "/data/home/azanette/TinyZero-PRM/verl/trainer/main_ppo.py", line 411, in main_task
+    trainer.init_workers()
+  File "/data/home/azanette/TinyZero-PRM/verl/trainer/ppo/ray_trainer.py", line 546, in init_workers
+    raise NotImplementedError
+NotImplementedError
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

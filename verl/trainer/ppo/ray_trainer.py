@@ -1060,29 +1060,6 @@ class RayPPOTrainer(object):
                             metrics['probe_all/n_correct'] = float(n_correct)
                             metrics['probe_all/n_incorrect'] = float(n_incorrect)
 
-                            # ── Overconfidence penalty on reward ──
-                            overconf_coeff = getattr(self.config.probe, 'overconf_coeff', 0.0)
-                            if overconf_coeff != 0.0:
-                                # Per-sample overconf: weighted sum of probe scores
-                                oc_per_sample = (probe_scores * overconf_weights.unsqueeze(0)).sum(dim=1)  # (batch_size,)
-                                penalty = overconf_coeff * oc_per_sample  # (batch_size,)
-
-                                # Subtract penalty at the last valid token of each sample
-                                # (same position where the original reward is placed)
-                                response_length = batch.batch['responses'].shape[-1]
-                                attention_mask = batch.batch['attention_mask']
-                                response_mask = attention_mask[:, -response_length:]
-                                # last valid token index within response for each sample
-                                last_valid_idx = response_mask.sum(dim=-1).long() - 1  # (batch_size,)
-                                last_valid_idx = last_valid_idx.clamp(min=0)
-                                reward_tensor[torch.arange(reward_tensor.shape[0], device=reward_tensor.device), last_valid_idx] -= penalty.to(reward_tensor.device)
-                                # Update token_level_scores with the penalised reward
-                                batch.batch['token_level_scores'] = reward_tensor
-
-                                metrics['probe_all/overconf_penalty_mean'] = penalty.mean().item()
-                                metrics['probe_all/overconf_penalty_abs_mean'] = penalty.abs().mean().item()
-                                metrics['probe_all/overconf_coeff'] = overconf_coeff
-
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:
                             batch, kl_metrics = apply_kl_penalty(batch,
@@ -1098,6 +1075,30 @@ class RayPPOTrainer(object):
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
+
+                        # ── Overconfidence penalty on advantage ──
+                        if 'probe_scores' in batch.batch.keys():
+                            overconf_coeff = getattr(self.config.probe, 'overconf_coeff', 0.0)
+                            if overconf_coeff != 0.0:
+                                probe_scores = batch.batch['probe_scores']
+                                num_trunc_points = probe_scores.shape[1]
+                                overconf_weights = torch.linspace(0.5, -0.5, num_trunc_points)
+
+                                # Per-sample overconf: weighted sum of probe scores
+                                oc_per_sample = (probe_scores * overconf_weights.unsqueeze(0)).sum(dim=1)  # (batch_size,)
+                                penalty = overconf_coeff * oc_per_sample  # (batch_size,)
+
+                                # Subtract penalty from advantage at all valid response tokens
+                                response_length = batch.batch['responses'].shape[-1]
+                                attention_mask = batch.batch['attention_mask']
+                                response_mask = attention_mask[:, -response_length:]
+                                advantages = batch.batch['advantages']
+                                advantages = advantages - penalty.unsqueeze(1).to(advantages.device) * response_mask.to(advantages.device)
+                                batch.batch['advantages'] = advantages
+
+                                metrics['probe_all/overconf_penalty_mean'] = penalty.mean().item()
+                                metrics['probe_all/overconf_penalty_abs_mean'] = penalty.abs().mean().item()
+                                metrics['probe_all/overconf_coeff'] = overconf_coeff
 
                     # update critic
                     if self.use_critic:

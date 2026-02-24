@@ -1,8 +1,12 @@
-sbatch train_1.sh count_down_327680_4_10_50 0.0
-sbatch train_1.sh count_down_327680_4_10_50 0.1
-sbatch train_1.sh count_down_327680_4_10_50 1.0
-sbatch train_1.sh count_down_327680_4_10_50 0.01
-sbatch train_1.sh count_down_327680_4_30_100 0.0
-sbatch train_1.sh count_down_327680_4_30_100 0.1
-sbatch train_1.sh count_down_327680_4_30_100 1.0
-sbatch train_1.sh count_down_327680_4_30_100 0.01
+# sbatch train_1.sh count_down_327680_4_10_50 0.0
+# sbatch train_1.sh count_down_327680_4_10_50 0.1
+# sbatch train_1.sh count_down_327680_4_10_50 1.0
+# sbatch train_1.sh count_down_327680_4_10_50 0.01
+# sbatch train_1.sh count_down_327680_4_30_100 0.0
+# sbatch train_1.sh count_down_327680_4_30_100 0.1
+# sbatch train_1.sh count_down_327680_4_30_100 1.0
+# sbatch train_1.sh count_down_327680_4_30_100 0.01
+# sbatch train_1.sh count_down_327680_4_10_10 0.0
+# sbatch train_1.sh count_down_327680_4_10_10 0.1
+# sbatch train_1.sh count_down_327680_4_10_10 1.0
+# sbatch train_1.sh count_down_327680_4_10_10 0.01

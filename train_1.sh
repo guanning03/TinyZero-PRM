@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tinyzero-prm
+#SBATCH --job-name=eval
 #SBATCH --partition=production
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -23,7 +23,7 @@ export BASE_MODEL=/home/azanette/TinyZero-PRM/checkpoints/base_models/Qwen2.5-3B
 export BASE_DATA_DIR=${1:-count_down_327680_3_3700_7400}
 DATA_DIR=countdown-data/${BASE_DATA_DIR}
 export ROLLOUT_TP_SIZE=1
-export EXPERIMENT_NAME=3b_rloo_${BASE_DATA_DIR}_coeff_${OVERCONF_COEFF}
+export EXPERIMENT_NAME=3b_grpo2_${BASE_DATA_DIR}_coeff_${OVERCONF_COEFF}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
 python3 -m verl.trainer.main_ppo \

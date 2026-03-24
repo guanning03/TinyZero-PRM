@@ -466,23 +466,52 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
+    @staticmethod
+    def _pass_at_k(n, c, k):
+        """Combinatorial estimator for pass@k.
+
+        Computes  1 - C(n-c, k) / C(n, k)  using the numerically stable
+        product form to avoid overflow with large binomial coefficients.
+
+        Args:
+            n: total number of samples
+            c: number of correct samples
+            k: the k in pass@k
+        Returns:
+            Estimated pass@k (float).  Returns 1.0 when k > n-c (guaranteed
+            at least one correct in any size-k subset).
+        """
+        if n - c < k:
+            return 1.0
+        # 1 - prod_{i=0}^{k-1} (n-c-i) / (n-i)
+        result = 1.0
+        for i in range(k):
+            result *= (n - c - i) / (n - i)
+        return 1.0 - result
+
     def _validate(self):
+        val_n = self.config.data.get('val_n', 1)
         reward_tensor_lst = []
         data_source_lst = []
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
-            # test_batch = test_batch.to('cuda')
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
 
             test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+
+            # repeat prompts val_n times for multiple samples
+            if val_n > 1:
+                test_gen_batch = test_gen_batch.repeat(repeat_times=val_n, interleave=True)
+                test_batch = test_batch.repeat(repeat_times=val_n, interleave=True)
+
             test_gen_batch.meta_info = {
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
                 'recompute_log_prob': False,
-                'do_sample': False,
+                'do_sample': val_n > 1,
                 'validate': True,
             }
 
@@ -496,25 +525,59 @@ class RayPPOTrainer(object):
             test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            # for certain reward function (e.g. sandbox), the generation can overlap with reward
             reward_tensor = self.val_reward_fn(test_batch)
 
             reward_tensor_lst.append(reward_tensor)
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (total,)
         data_sources = np.concatenate(data_source_lst, axis=0)
-        # evaluate test_score based on data source
-        data_source_reward = {}
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
 
         metric_dict = {}
-        for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+
+        if val_n <= 1:
+            # original single-sample logic
+            data_source_reward = {}
+            for i in range(reward_tensor.shape[0]):
+                ds = data_sources[i]
+                if ds not in data_source_reward:
+                    data_source_reward[ds] = []
+                data_source_reward[ds].append(reward_tensor[i].item())
+            for ds, rewards in data_source_reward.items():
+                metric_dict[f'val/test_score/{ds}'] = np.mean(rewards)
+        else:
+            # multiple samples: compute pass@k for powers of 2
+            # rewards are interleaved: prompt0_s0, prompt0_s1, ..., prompt0_sN, prompt1_s0, ...
+            num_total = reward_tensor.shape[0]
+            num_prompts = num_total // val_n
+            # reshape to (num_prompts, val_n)
+            rewards_grouped = reward_tensor[:num_prompts * val_n].view(num_prompts, val_n)
+            sources_grouped = data_sources[:num_prompts * val_n].reshape(num_prompts, val_n)
+
+            # correctness: score >= 1.0 means correct
+            correct_mask = (rewards_grouped >= 1.0)  # (num_prompts, val_n)
+            correct_counts = correct_mask.sum(dim=1)  # (num_prompts,)
+
+            # group by data_source (use first sample's source for each prompt)
+            ds_indices = {}
+            for i in range(num_prompts):
+                ds = sources_grouped[i, 0]
+                if ds not in ds_indices:
+                    ds_indices[ds] = []
+                ds_indices[ds].append(i)
+
+            for ds, indices in ds_indices.items():
+                c_arr = correct_counts[indices]
+                n = val_n
+                # mean accuracy
+                metric_dict[f'val/test_score/{ds}'] = (c_arr.float().sum() / (len(indices) * n)).item()
+
+                # pass@k for each power of 2 up to val_n
+                k = 1
+                while k <= n:
+                    pass_k_values = [self._pass_at_k(n, c.item(), k) for c in c_arr]
+                    metric_dict[f'val/pass@{k}/{ds}'] = np.mean(pass_k_values)
+                    k *= 2
 
         return metric_dict
 

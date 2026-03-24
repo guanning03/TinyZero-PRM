@@ -1,21 +1,40 @@
-export WANDB_API_KEY=256879fdda25bc1fb8ee4f0310e71615e92f75c9
-export HF_TOKEN=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
+#!/bin/bash
+#SBATCH --job-name=eval
+#SBATCH --partition=general
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=64
+#SBATCH --gres=gpu:4
+#SBATCH --mem=512G
+#SBATCH --output=logs/slurm-%j.log
+#SBATCH --error=logs/slurm-%j.log
+
+source /home/jgai/miniconda3/etc/profile.d/conda.sh
+conda activate tinyzero_env
+export PATH=/home/jgai/miniconda3/envs/tinyzero_env/bin:$PATH
+export RAY_TMPDIR=/data/user_data/jgai/tmp/ray
+mkdir -p /data/user_data/jgai/tmp/ray
+
+export WANDB_API_KEY=${WANDB_API_KEY:?"Please set WANDB_API_KEY environment variable"}
+export HF_TOKEN=${HF_TOKEN:?"Please set HF_TOKEN environment variable"}
 export WANDB_ENTITY=Tsinghua-IIIS-AI-Team
 
-export N_GPUS=8
-export BASE_MODEL=/home/azanette/TinyZero-PRM/checkpoints/base_models/Qwen2.5-3B
-export BASE_DATA_DIR=${1:-count_down_327680_3_3700_7400}
-DATA_DIR=countdown-data/${BASE_DATA_DIR}
+CHECKPOINT_NAME=${1:?"Usage: sbatch eval.sh <checkpoint_name>"}
+
+export N_GPUS=4
+export BASE_MODEL=/data/user_data/jgai/countdown_20260225/${CHECKPOINT_NAME}/global_step_400
+DATA_DIR=/home/jgai/code-guanning/countdown-data/count_down_327680_4_30_100
 export ROLLOUT_TP_SIZE=1
-export EXPERIMENT_NAME=3b-${BASE_DATA_DIR}
+export EXPERIMENT_NAME=eval_${CHECKPOINT_NAME}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=rloo \
+    algorithm.adv_estimator=grpo \
     data.train_files=$DATA_DIR/train.parquet \
     data.val_files=$DATA_DIR/test.parquet \
     data.train_batch_size=128 \
     data.val_batch_size=640 \
+    +data.val_n=128 \
     data.max_prompt_length=256 \
     data.max_response_length=1024 \
     actor_rollout_ref.model.path=$BASE_MODEL \
@@ -34,7 +53,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
-    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.temperature=0.7 \
+    actor_rollout_ref.rollout.top_p=0.98 \
+    actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
@@ -44,17 +65,13 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
-    trainer.test_freq=10 \
-    trainer.project_name=TinyZero-PRM-Debug-Guanning \
+    trainer.save_freq=9999 \
+    trainer.test_freq=1 \
+    trainer.project_name=TinyZero-Eval \
     trainer.experiment_name=$EXPERIMENT_NAME \
-    trainer.total_epochs=15 \
-    probe.enable=True \
-    probe.num_truncations=5 \
-    probe.mc_samples=10 \
-    probe.mc_max_tokens=32 \
-    probe.num_splits=8 \
+    trainer.total_epochs=1 \
+    trainer.total_training_steps=2 \
+    probe.enable=False \
     reward.use_pool=True \
     reward.num_workers=4 \
-    reward.timeout=120 \
-    2>&1 | tee verl_demo.log
+    reward.timeout=120
